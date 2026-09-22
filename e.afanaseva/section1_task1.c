@@ -25,11 +25,6 @@ int main(int argc, char *argv[])
 
     opterr = 0;
 
-    /*
-     * getopt() reads options from left to right.
-     * We save all options and process them later
-     * from right to left.
-     */
     while ((opt = getopt(argc, argv, "ispduU:cC:vV:")) != -1)
     {
 
@@ -60,9 +55,6 @@ int main(int argc, char *argv[])
         option_count++;
     }
 
-    /*
-     * Process options from right to left.
-     */
     for (int i = option_count - 1; i >= 0; i--)
     {
 
