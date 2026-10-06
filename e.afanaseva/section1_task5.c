@@ -4,7 +4,6 @@
 #include <unistd.h>
 
 #define MAX_LINES 100
-#define BUFFER_SIZE 1024
 
 struct Line
 {
@@ -15,11 +14,12 @@ struct Line
 int main(int argc, char *argv[])
 {
     int fd;
-    char buffer[BUFFER_SIZE];
+    char ch;
     struct Line lines[MAX_LINES];
-
     int line_count = 0;
+
     off_t line_start = 0;
+    off_t current_position;
     ssize_t bytes_read;
 
     if (argc != 2)
@@ -36,28 +36,32 @@ int main(int argc, char *argv[])
         return 1;
     }
 
-    while ((bytes_read = read(fd, buffer, sizeof(buffer))) > 0)
+    while ((bytes_read = read(fd, &ch, 1)) > 0)
     {
-        for (ssize_t i = 0; i < bytes_read; i++)
+        if (ch == '\n')
         {
-            if (buffer[i] == '\n')
+            if (line_count >= MAX_LINES)
             {
-                if (line_count >= MAX_LINES)
-                {
-                    fprintf(stderr, "Too many lines\n");
-                    close(fd);
-                    return 1;
-                }
-
-                lines[line_count].offset = line_start;
-                lines[line_count].length =
-                    (off_t)lseek(fd, 0L, SEEK_CUR) - bytes_read + i + 1 - line_start;
-
-                line_start =
-                    (off_t)lseek(fd, 0L, SEEK_CUR) - bytes_read + i + 1;
-
-                line_count++;
+                fprintf(stderr, "Too many lines\n");
+                close(fd);
+                return 1;
             }
+
+            current_position = lseek(fd, 0L, 1);
+
+            if (current_position == (off_t)-1)
+            {
+                perror("lseek");
+                close(fd);
+                return 1;
+            }
+
+            lines[line_count].offset = line_start;
+            lines[line_count].length =
+                current_position - line_start;
+
+            line_count++;
+            line_start = current_position;
         }
     }
 
@@ -68,7 +72,16 @@ int main(int argc, char *argv[])
         return 1;
     }
 
-    if (line_start < lseek(fd, 0L, SEEK_CUR))
+    current_position = lseek(fd, 0L, 1);
+
+    if (current_position == (off_t)-1)
+    {
+        perror("lseek");
+        close(fd);
+        return 1;
+    }
+
+    if (line_start < current_position)
     {
         if (line_count >= MAX_LINES)
         {
@@ -78,14 +91,13 @@ int main(int argc, char *argv[])
         }
 
         lines[line_count].offset = line_start;
-
         lines[line_count].length =
-            lseek(fd, 0L, SEEK_CUR) - line_start;
+            current_position - line_start;
 
         line_count++;
     }
 
-    printf("Таблица строк:\n");
+    printf("Таблица строк:\n\n");
     printf("№\tОтступ\tДлина\n");
 
     for (int i = 0; i < line_count; i++)
@@ -126,17 +138,32 @@ int main(int argc, char *argv[])
             return 1;
         }
 
-        ssize_t n = read(fd, buffer, lines[number - 1].length);
+        size_t length = lines[number - 1].length;
 
-        if (n == -1)
+        char *line = malloc(length + 1);
+
+        if (line == NULL)
         {
-            perror("read");
+            perror("malloc");
             close(fd);
             return 1;
         }
 
-        printf("Строка %d: ", number);
-        write(STDOUT_FILENO, buffer, n);
+        ssize_t n = read(fd, line, length);
+
+        if (n == -1)
+        {
+            perror("read");
+            free(line);
+            close(fd);
+            return 1;
+        }
+
+        line[n] = '\0';
+
+        printf("%s", line);
+
+        free(line);
     }
 
     if (close(fd) == -1)
