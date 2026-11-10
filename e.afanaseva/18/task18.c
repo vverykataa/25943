@@ -12,8 +12,22 @@
 
 static void get_permissions(mode_t mode, char permissions[11])
 {
-    permissions[0] = S_ISDIR(mode) ? 'd' : S_ISREG(mode) ? '-'
-                                                         : '?';
+    if (S_ISDIR(mode))
+        permissions[0] = 'd';
+    else if (S_ISREG(mode))
+        permissions[0] = '-';
+    else if (S_ISLNK(mode))
+        permissions[0] = 'l';
+    else if (S_ISCHR(mode))
+        permissions[0] = 'c';
+    else if (S_ISBLK(mode))
+        permissions[0] = 'b';
+    else if (S_ISFIFO(mode))
+        permissions[0] = 'p';
+    else if (S_ISSOCK(mode))
+        permissions[0] = 's';
+    else
+        permissions[0] = '?';
 
     permissions[1] = (mode & S_IRUSR) ? 'r' : '-';
     permissions[2] = (mode & S_IWUSR) ? 'w' : '-';
@@ -26,6 +40,15 @@ static void get_permissions(mode_t mode, char permissions[11])
     permissions[7] = (mode & S_IROTH) ? 'r' : '-';
     permissions[8] = (mode & S_IWOTH) ? 'w' : '-';
     permissions[9] = (mode & S_IXOTH) ? 'x' : '-';
+
+    if (mode & S_ISUID)
+        permissions[3] = (mode & S_IXUSR) ? 's' : 'S';
+
+    if (mode & S_ISGID)
+        permissions[6] = (mode & S_IXGRP) ? 's' : 'S';
+
+    if (mode & S_ISVTX)
+        permissions[9] = (mode & S_IXOTH) ? 't' : 'T';
 
     permissions[10] = '\0';
 }
@@ -50,7 +73,8 @@ static void get_group(gid_t gid, char *group, size_t size)
         snprintf(group, size, "%" PRIuMAX, (uintmax_t)gid);
 }
 
-static void get_size(const struct stat *st, char *size, size_t size_length)
+static void get_size(const struct stat *st, char *size,
+                     size_t size_length)
 {
     if (S_ISREG(st->st_mode))
         snprintf(size, size_length, "%" PRIdMAX,
@@ -75,13 +99,13 @@ static void get_filename(const char *path,
 {
     size_t end = strlen(path);
 
-    while (end > 1 && path[end - 1] == '/')
+    while (end > 0 && path[end - 1] == '/')
         end--;
 
-    if (end == 1 && path[0] == '/')
+    if (end == 0)
     {
         *start = path;
-        *length = 1;
+        *length = strlen(path) > 0 ? 1 : 0;
         return;
     }
 
@@ -120,7 +144,7 @@ static int print_file_info(const char *path)
     get_date(st.st_mtime, date, sizeof(date));
     get_filename(path, &filename, &filename_length);
 
-    printf("%-10s %5" PRIuMAX " %-12s %-12s %10s %-16s ",
+    printf("%-11s %5" PRIuMAX " %-12s %-12s %10s %-16s ",
            permissions,
            (uintmax_t)st.st_nlink,
            owner,
@@ -138,7 +162,7 @@ int main(int argc, char *argv[])
 {
     int error = 0;
 
-    printf("%-10s %5s %-12s %-12s %10s %-16s %s\n",
+    printf("%-11s %5s %-12s %-12s %10s %-16s %s\n",
            "Permissions",
            "Links",
            "Owner",
