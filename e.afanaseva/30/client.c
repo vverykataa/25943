@@ -6,15 +6,19 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
+#include <sys/types.h>
 #include <sys/un.h>
 #include <termios.h>
 #include <unistd.h>
 #define INPUT_LIMIT 80
 #define BUFFER_SIZE 4096
+#define CONNECT_ATTEMPTS 30
 
 static struct termios old_terminal;
 static int terminal_changed = 0;
+
 static volatile sig_atomic_t stopped = 0;
+static volatile sig_atomic_t suspend_requested = 0;
 
 static void restore_terminal(void)
 {
@@ -26,9 +30,90 @@ static void restore_terminal(void)
     }
 }
 
-static void stop_handler(int signum)
+static void signal_handler(int signum)
 {
-    stopped = signum;
+    if (signum == SIGTSTP)
+        suspend_requested = 1;
+    else
+        stopped = signum;
+}
+
+static int wait_for_foreground(void)
+{
+    pid_t foreground;
+
+    for (;;)
+    {
+        foreground = tcgetpgrp(STDIN_FILENO);
+
+        if (foreground == -1)
+        {
+            perror("tcgetpgrp");
+            return -1;
+        }
+
+        if (foreground == getpgrp())
+            return 0;
+
+        if (kill(0, SIGTTIN) == -1)
+        {
+            perror("SIGTTIN");
+            return -1;
+        }
+    }
+}
+
+static int enable_terminal(void)
+{
+    struct termios settings = old_terminal;
+
+    settings.c_lflag &= (tcflag_t) ~(
+        ICANON | ECHO | ECHONL | ISIG | IEXTEN);
+
+    settings.c_iflag &= (tcflag_t) ~(
+        IXON | IXOFF | ISTRIP | INLCR | IGNCR);
+
+    settings.c_iflag |= ICRNL;
+    settings.c_cc[VMIN] = 1;
+    settings.c_cc[VTIME] = 0;
+
+    if (tcsetattr(STDIN_FILENO, TCSAFLUSH,
+                  &settings) == -1)
+    {
+        perror("tcsetattr");
+        return -1;
+    }
+
+    terminal_changed = 1;
+    return 0;
+}
+
+static void redraw(const char *line, size_t length)
+{
+    fprintf(stderr, "\r\033[2K%.*s",
+            (int)length, line);
+    fflush(stderr);
+}
+
+static int suspend_input(const char *line, size_t length)
+{
+    restore_terminal();
+    suspend_requested = 0;
+
+    if (raise(SIGSTOP) != 0)
+    {
+        perror("raise");
+        return -1;
+    }
+
+    if (wait_for_foreground() == -1)
+        return -1;
+
+    if (enable_terminal() == -1)
+        return -1;
+
+    redraw(line, length);
+    return 0;
 }
 
 static int make_address(struct sockaddr_un *address,
@@ -36,8 +121,13 @@ static int make_address(struct sockaddr_un *address,
 {
     size_t length = strlen(path);
 
-    if (length == 0 ||
-        length >= sizeof(address->sun_path))
+    if (length == 0)
+    {
+        errno = EINVAL;
+        return -1;
+    }
+
+    if (length >= sizeof(address->sun_path))
     {
         errno = ENAMETOOLONG;
         return -1;
@@ -50,7 +140,8 @@ static int make_address(struct sockaddr_un *address,
     return 0;
 }
 
-static int write_all(int fd, const char *buffer, size_t length)
+static int write_all(int fd, const char *buffer,
+                     size_t length)
 {
     size_t written = 0;
 
@@ -59,7 +150,7 @@ static int write_all(int fd, const char *buffer, size_t length)
         ssize_t n = write(fd, buffer + written,
                           length - written);
 
-        if (n == -1)
+        if (n < 0)
         {
             if (errno == EINTR)
                 continue;
@@ -83,19 +174,20 @@ static int write_all(int fd, const char *buffer, size_t length)
 
 static int read_key(unsigned char *key, int timeout)
 {
-    struct pollfd pfd;
+    struct pollfd input;
     int result;
 
-    pfd.fd = STDIN_FILENO;
-    pfd.events = POLLIN;
+    input.fd = STDIN_FILENO;
+    input.events = POLLIN;
 
-    while (!stopped)
+    while (!stopped && !suspend_requested)
     {
-        pfd.revents = 0;
+        input.revents = 0;
 
-        result = poll(&pfd, 1, timeout < 0 ? 100 : timeout);
+        result = poll(&input, 1,
+                      timeout < 0 ? 100 : timeout);
 
-        if (result == -1)
+        if (result < 0)
         {
             if (errno == EINTR)
                 continue;
@@ -120,7 +212,7 @@ static int read_key(unsigned char *key, int timeout)
             return -1;
     }
 
-    return -1;
+    return -2;
 }
 
 static void skip_escape(void)
@@ -153,22 +245,16 @@ static void skip_escape(void)
     }
 }
 
-static void redraw(const char *line, size_t length)
-{
-    fprintf(stderr, "\r\033[2K%.*s", (int)length, line);
-    fflush(stderr);
-}
-
 static int terminal_input(int socket_fd)
 {
-    struct termios settings;
     struct sigaction action;
-
     char line[INPUT_LIMIT + 1];
     size_t length = 0;
-
     unsigned char key;
     int status = EXIT_SUCCESS;
+
+    if (wait_for_foreground() == -1)
+        return EXIT_FAILURE;
 
     if (tcgetattr(STDIN_FILENO, &old_terminal) == -1)
     {
@@ -179,54 +265,52 @@ static int terminal_input(int socket_fd)
     if (atexit(restore_terminal) != 0)
         return EXIT_FAILURE;
 
-    action.sa_handler = stop_handler;
+    memset(&action, 0, sizeof(action));
+    action.sa_handler = signal_handler;
     sigemptyset(&action.sa_mask);
     action.sa_flags = 0;
 
     if (sigaction(SIGINT, &action, NULL) == -1 ||
         sigaction(SIGQUIT, &action, NULL) == -1 ||
         sigaction(SIGTERM, &action, NULL) == -1 ||
-        sigaction(SIGHUP, &action, NULL) == -1)
+        sigaction(SIGHUP, &action, NULL) == -1 ||
+        sigaction(SIGTSTP, &action, NULL) == -1)
     {
         perror("sigaction");
         return EXIT_FAILURE;
     }
 
-    settings = old_terminal;
-
-    settings.c_lflag &= (tcflag_t) ~(
-        ICANON | ECHO | ECHONL | ISIG | IEXTEN);
-
-    settings.c_iflag &= (tcflag_t) ~(
-        IXON | IXOFF | ISTRIP | INLCR | IGNCR);
-
-    settings.c_iflag |= ICRNL;
-    settings.c_cc[VMIN] = 1;
-    settings.c_cc[VTIME] = 0;
-
-    if (tcsetattr(STDIN_FILENO, TCSAFLUSH,
-                  &settings) == -1)
-    {
-        perror("tcsetattr");
+    if (enable_terminal() == -1)
         return EXIT_FAILURE;
-    }
-
-    terminal_changed = 1;
 
     fprintf(stderr,
             "Enter English text (max 80 characters)\n"
             "Backspace: erase character\n"
             "Ctrl+U: erase line\n"
             "Ctrl+W: erase word\n"
+            "Ctrl+Z: suspend client\n"
             "Ctrl+D: disconnect on empty line\n");
 
     while (!stopped)
     {
+        if (suspend_requested)
+        {
+            if (suspend_input(line, length) == -1)
+            {
+                status = EXIT_FAILURE;
+                break;
+            }
+            continue;
+        }
+
         int result = read_key(&key, -1);
+
+        if (result == -2)
+            continue;
 
         if (result <= 0)
         {
-            if (result < 0 && !stopped)
+            if (result < 0)
             {
                 perror("read/poll");
                 status = EXIT_FAILURE;
@@ -234,9 +318,14 @@ static int terminal_input(int socket_fd)
             break;
         }
 
-        if (key == 3 || key == 28)
+        if (key == 26)
         {
-            stopped = (key == 3) ? SIGINT : SIGQUIT;
+            suspend_requested = 1;
+            continue;
+        }
+        else if (key == 3 || key == 28)
+        {
+            stopped = key == 3 ? SIGINT : SIGQUIT;
             break;
         }
         else if (key == 4)
@@ -251,7 +340,8 @@ static int terminal_input(int socket_fd)
             skip_escape();
         }
         else if (key == 8 || key == 127 ||
-                 (old_terminal.c_cc[VERASE] != _POSIX_VDISABLE &&
+                 (old_terminal.c_cc[VERASE] !=
+                      _POSIX_VDISABLE &&
                   key == old_terminal.c_cc[VERASE]))
         {
             if (length > 0)
@@ -260,7 +350,8 @@ static int terminal_input(int socket_fd)
             redraw(line, length);
         }
         else if (key == 21 ||
-                 (old_terminal.c_cc[VKILL] != _POSIX_VDISABLE &&
+                 (old_terminal.c_cc[VKILL] !=
+                      _POSIX_VDISABLE &&
                   key == old_terminal.c_cc[VKILL]))
         {
             length = 0;
@@ -268,10 +359,12 @@ static int terminal_input(int socket_fd)
         }
         else if (key == 23)
         {
-            while (length > 0 && line[length - 1] == ' ')
+            while (length > 0 &&
+                   line[length - 1] == ' ')
                 length--;
 
-            while (length > 0 && line[length - 1] != ' ')
+            while (length > 0 &&
+                   line[length - 1] != ' ')
                 length--;
 
             redraw(line, length);
@@ -312,14 +405,14 @@ static int terminal_input(int socket_fd)
     fputc('\n', stderr);
     restore_terminal();
 
-    return stopped ? EXIT_FAILURE : status;
+    return stopped ? 128 + (int)stopped : status;
 }
 
 static int transfer_input(int socket_fd)
 {
     char buffer[BUFFER_SIZE];
 
-    while (1)
+    for (;;)
     {
         ssize_t n = read(STDIN_FILENO,
                          buffer, sizeof(buffer));
@@ -336,30 +429,62 @@ static int transfer_input(int socket_fd)
         if (n == 0)
             return EXIT_SUCCESS;
 
-        if (write_all(socket_fd, buffer, (size_t)n) == -1)
+        if (write_all(socket_fd, buffer,
+                      (size_t)n) == -1)
             return EXIT_FAILURE;
     }
+}
+
+static int connect_with_retry(int fd,
+                              struct sockaddr_un *address)
+{
+    for (int attempt = 0;
+         attempt < CONNECT_ATTEMPTS;
+         attempt++)
+    {
+        if (connect(fd, (struct sockaddr *)address,
+                    sizeof(*address)) == 0)
+            return 0;
+
+        if (errno != ENOENT && errno != ECONNREFUSED)
+        {
+            perror("connect");
+            return -1;
+        }
+
+        if (attempt + 1 < CONNECT_ATTEMPTS)
+            (void)poll(NULL, 0, 100);
+    }
+
+    perror("connect");
+    return -1;
 }
 
 int main(int argc, char *argv[])
 {
     int socket_fd;
     int status;
-
     char default_path[sizeof(((struct sockaddr_un *)0)->sun_path)];
     const char *path;
-
     struct sockaddr_un address;
     struct sigaction action;
 
     if (argc > 2)
     {
-        fprintf(stderr, "Usage: %s [socket_path]\n", argv[0]);
+        fprintf(stderr, "Usage: %s [socket_path]\n",
+                argv[0]);
         return EXIT_FAILURE;
     }
 
-    snprintf(default_path, sizeof(default_path),
-             "/tmp/task30_%ld.sock", (long)getuid());
+    int n = snprintf(default_path, sizeof(default_path),
+                     "/tmp/task30_%ld.sock",
+                     (long)getuid());
+
+    if (n < 0 || (size_t)n >= sizeof(default_path))
+    {
+        fprintf(stderr, "Socket path is too long\n");
+        return EXIT_FAILURE;
+    }
 
     path = argc == 2 ? argv[1] : default_path;
 
@@ -369,13 +494,13 @@ int main(int argc, char *argv[])
         return EXIT_FAILURE;
     }
 
+    memset(&action, 0, sizeof(action));
     action.sa_handler = SIG_IGN;
     sigemptyset(&action.sa_mask);
-    action.sa_flags = 0;
 
     if (sigaction(SIGPIPE, &action, NULL) == -1)
     {
-        perror("sigaction");
+        perror("sigaction SIGPIPE");
         return EXIT_FAILURE;
     }
 
@@ -387,11 +512,10 @@ int main(int argc, char *argv[])
         return EXIT_FAILURE;
     }
 
-    if (connect(socket_fd, (struct sockaddr *)&address,
-                sizeof(address)) == -1)
+    if (connect_with_retry(socket_fd, &address) == -1)
     {
-        perror("connect");
-        fprintf(stderr, "Start server first: %s\n", path);
+        fprintf(stderr, "Start server first: %s\n",
+                path);
         close(socket_fd);
         return EXIT_FAILURE;
     }
