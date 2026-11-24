@@ -42,7 +42,7 @@ static struct Client *first_client;
 static struct Client *second_client;
 
 static const char *const parts[] = {
-    NULL, "Hello ", "nice hat\n", "World\n"};
+    NULL, "Hello ", "good day\n", "World\n"};
 static const size_t lengths[] = {0, 6, 9, 6};
 
 static void stop_server(int signum)

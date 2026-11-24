@@ -84,7 +84,7 @@ static int send_sync(int fd, int number)
     else
     {
         if (write_all(fd,
-                      (const unsigned char *)"nice hat\n", 9) == -1)
+                      (const unsigned char *)"good day\n", 9) == -1)
             goto error;
     }
 

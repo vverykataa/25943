@@ -108,7 +108,7 @@ static void close_client(struct pollfd fds[], int ids[],
  * Synchronization:
  * stage 0: wait for two clients
  * stage 1: client 1 sends "Hello "
- * stage 2: client 2 sends "nice hat\n"
+ * stage 2: client 2 sends "good day\n"
  * stage 3: client 1 sends "World\n"
  * stage 4: demonstration completed
  */
@@ -118,7 +118,7 @@ static int process_sync(struct pollfd fds[],
                         int index, int *stage)
 {
     static const char *const parts[] = {
-        NULL, "Hello ", "nice hat\n", "World\n"};
+        NULL, "Hello ", "good day\n", "World\n"};
     static const size_t lengths[] = {0, 6, 9, 6};
 
     unsigned char buffer[BUFFER_SIZE];

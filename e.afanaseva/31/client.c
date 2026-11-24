@@ -251,7 +251,7 @@ static int send_sync(int fd, int number)
     }
     else
     {
-        if (write_all(fd, "nice hat\n", 9) == -1)
+        if (write_all(fd, "good day\n", 9) == -1)
             return EXIT_FAILURE;
     }
 
