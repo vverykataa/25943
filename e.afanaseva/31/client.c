@@ -11,8 +11,8 @@
 #include <sys/un.h>
 #include <termios.h>
 #include <unistd.h>
-#define INPUT_LIMIT 80
-#define BUFFER_SIZE 4096
+#define INPUT_LIMIT 1024
+#define BUFFER_SIZE 8192
 #define CONNECT_ATTEMPTS 30
 
 static struct termios old_terminal;

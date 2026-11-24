@@ -20,7 +20,6 @@ socket="/tmp/task${task}_$(id -u).sock"
 
 if [[ -e "$socket" ]]; then
     echo "Socket already exists: $socket"
-    echo "Stop the previous server first."
     exit 1
 fi
 
@@ -42,9 +41,9 @@ fi
 (
     perl -e '
         $| = 1;
-        for (1..100) {
+        for (1..2000) {
             print "a";
-            select(undef, undef, undef, 0.02);
+            select(undef, undef, undef, 0.001);
         }
         print "\n";
     ' | ./client
@@ -54,9 +53,9 @@ client1_pid=$!
 (
     perl -e '
         $| = 1;
-        for (1..100) {
+        for (1..2000) {
             print "b";
-            select(undef, undef, undef, 0.02);
+            select(undef, undef, undef, 0.001);
         }
         print "\n";
     ' | ./client

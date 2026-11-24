@@ -11,7 +11,7 @@
 #include <sys/un.h>
 #include <unistd.h>
 #define MAX_CLIENTS 64
-#define BUFFER_SIZE 4096
+#define BUFFER_SIZE 8192
 
 static volatile sig_atomic_t stopped = 0;
 

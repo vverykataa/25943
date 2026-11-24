@@ -9,8 +9,8 @@
 #include <termios.h>
 #include <unistd.h>
 #include <time.h>
-#define LINE_LIMIT 80
-#define BUFFER_SIZE 4096
+#define LINE_LIMIT 1024
+#define BUFFER_SIZE 8192
 
 static struct termios saved_terminal;
 static volatile sig_atomic_t interrupted = 0;
