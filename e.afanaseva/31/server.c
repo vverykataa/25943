@@ -506,6 +506,13 @@ int main(int argc, char *argv[])
         return EXIT_FAILURE;
     }
 
+    /* A disconnected sync client must not terminate the server via SIGPIPE. */
+    if (signal(SIGPIPE, SIG_IGN) == SIG_ERR)
+    {
+        perror("signal SIGPIPE");
+        return EXIT_FAILURE;
+    }
+
     listener = socket(AF_UNIX, SOCK_STREAM, 0);
 
     if (listener == -1)

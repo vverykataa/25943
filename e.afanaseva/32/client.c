@@ -12,6 +12,28 @@
 #define LINE_LIMIT 80
 #define BUFFER_SIZE 4096
 
+static struct termios saved_terminal;
+static volatile sig_atomic_t interrupted = 0;
+static volatile sig_atomic_t suspend_requested = 0;
+static int terminal_active = 0;
+
+static void restore_terminal(void)
+{
+    if (terminal_active)
+    {
+        (void)tcsetattr(STDIN_FILENO, TCSANOW, &saved_terminal);
+        terminal_active = 0;
+    }
+}
+
+static void input_signal(int signum)
+{
+    if (signum == SIGTSTP)
+        suspend_requested = 1;
+    else
+        interrupted = signum;
+}
+
 static int write_all(int fd, const unsigned char *data,
                      size_t length)
 {
@@ -139,6 +161,24 @@ static int send_terminal(int fd)
         return EXIT_FAILURE;
     }
 
+    saved_terminal = original;
+    if (atexit(restore_terminal) != 0)
+        return EXIT_FAILURE;
+
+    struct sigaction action;
+    memset(&action, 0, sizeof(action));
+    action.sa_handler = input_signal;
+    sigemptyset(&action.sa_mask);
+    if (sigaction(SIGTERM, &action, NULL) == -1 ||
+        sigaction(SIGINT, &action, NULL) == -1 ||
+        sigaction(SIGHUP, &action, NULL) == -1 ||
+        sigaction(SIGQUIT, &action, NULL) == -1 ||
+        sigaction(SIGTSTP, &action, NULL) == -1)
+    {
+        perror("sigaction");
+        return EXIT_FAILURE;
+    }
+
     settings = original;
     settings.c_lflag &=
         (tcflag_t) ~(ICANON | ECHO | ISIG | IEXTEN);
@@ -154,6 +194,8 @@ static int send_terminal(int fd)
         return EXIT_FAILURE;
     }
 
+    terminal_active = 1;
+
     fprintf(stderr, "Enter English text (max 80 characters)\n");
     fprintf(stderr, "Backspace: erase character\n");
     fprintf(stderr, "Ctrl+U: erase line\n");
@@ -163,6 +205,26 @@ static int send_terminal(int fd)
 
     for (;;)
     {
+        if (interrupted)
+        {
+            status = 128 + interrupted;
+            break;
+        }
+        if (suspend_requested)
+        {
+            suspend_requested = 0;
+            restore_terminal();
+            if (raise(SIGSTOP) == -1 || wait_foreground() == -1 ||
+                tcsetattr(STDIN_FILENO, TCSANOW, &settings) == -1)
+            {
+                perror("resume terminal");
+                status = EXIT_FAILURE;
+                break;
+            }
+            terminal_active = 1;
+            show_line(line, length);
+            continue;
+        }
         unsigned char key;
         ssize_t n = read(STDIN_FILENO, &key, 1);
 
@@ -209,6 +271,7 @@ static int send_terminal(int fd)
                 break;
             }
 
+            terminal_active = 0;
             if (raise(SIGSTOP) == -1 ||
                 wait_foreground() == -1 ||
                 tcsetattr(STDIN_FILENO, TCSANOW,
@@ -219,6 +282,7 @@ static int send_terminal(int fd)
                 break;
             }
 
+            terminal_active = 1;
             show_line(line, length);
         }
         else if (key == 3)
@@ -282,13 +346,7 @@ static int send_terminal(int fd)
 
     fputc('\n', stderr);
 
-    if (tcsetattr(STDIN_FILENO, TCSANOW,
-                  &original) == -1)
-    {
-        perror("restore terminal");
-        status = EXIT_FAILURE;
-    }
-
+    restore_terminal();
     return status;
 }
 

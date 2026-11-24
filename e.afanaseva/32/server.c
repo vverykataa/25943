@@ -28,6 +28,10 @@ static struct Client *clients[MAX_CLIENTS];
 static pthread_mutex_t mutex = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t finished = PTHREAD_COND_INITIALIZER;
 static sigset_t completion_signals;
+static sigset_t termination_signals;
+static pthread_t main_thread;
+static volatile sig_atomic_t stopping = 0;
+static int collector_done = 0;
 
 static const char *socket_path;
 static int listener = -1;
@@ -45,14 +49,33 @@ static const char *const parts[] = {
     NULL, "Hello ", "good day\n", "World\n"};
 static const size_t lengths[] = {0, 6, 9, 6};
 
-static void stop_server(int signum)
+static void interrupt_accept(int signum)
 {
     (void)signum;
-    if (listener != -1)
-        close(listener);
-    if (socket_path != NULL)
-        unlink(socket_path);
-    _exit(0);
+}
+
+static void *watch_termination(void *unused)
+{
+    (void)unused;
+    int signum;
+    int error = sigwait(&termination_signals, &signum);
+    if (error == 0)
+    {
+        stopping = 1;
+        (void)pthread_kill(main_thread, SIGUSR2);
+    }
+    return NULL;
+}
+
+static void abort_sync_locked(void)
+{
+    failed = 1;
+    (void)pthread_kill(main_thread, SIGUSR2);
+    for (int i = 0; i < MAX_CLIENTS; i++)
+    {
+        if (clients[i] != NULL)
+            (void)shutdown(clients[i]->request.aio_fildes, SHUT_RDWR);
+    }
 }
 
 static int write_all(int fd, const unsigned char *data,
@@ -197,7 +220,11 @@ static void disconnect_client(int index, int error)
     struct Client *client = clients[index];
 
     if (error)
+    {
         failed = 1;
+        if (sync_mode)
+            abort_sync_locked();
+    }
 
     if (sync_mode && client->role != 0)
     {
@@ -206,9 +233,12 @@ static void disconnect_client(int index, int error)
         {
             fprintf(stderr,
                     "Client disconnected before sync finished\n");
-            failed = 1;
+            abort_sync_locked();
         }
     }
+
+    if (sync_mode && client->role == 0 && sync_stage != 4)
+        abort_sync_locked();
 
     fprintf(stderr, "Client %d disconnected\n",
             client->number);
@@ -257,7 +287,7 @@ static void process_client(int index)
         if (sync_input(client, client->buffer,
                        (size_t)count) == -1)
         {
-            perror("sync input");
+            fprintf(stderr, "Sync protocol or connection error\n");
             disconnect_client(index, 1);
             return;
         }
@@ -303,6 +333,11 @@ static void *collect_reads(void *unused)
         }
 
         pthread_mutex_lock(&mutex);
+        if (collector_done)
+        {
+            pthread_mutex_unlock(&mutex);
+            break;
+        }
 
         for (int i = 0; i < MAX_CLIENTS; i++)
         {
@@ -379,37 +414,59 @@ static int add_client(int fd)
 static int serve(int listener_fd)
 {
     int accepted = 0;
+    int accept_error = 0;
 
-    while (!sync_mode || accepted < 2)
+    while (!stopping && (!sync_mode || accepted < 2))
     {
         int fd = accept(listener_fd, NULL, NULL);
 
         if (fd == -1)
         {
             if (errno == EINTR)
+            {
+                pthread_mutex_lock(&mutex);
+                int sync_failed = sync_mode && failed;
+                pthread_mutex_unlock(&mutex);
+                if (sync_failed)
+                {
+                    accept_error = 1;
+                    break;
+                }
                 continue;
+            }
+            if (stopping)
+                break;
             perror("accept");
-            return EXIT_FAILURE;
+            accept_error = 1;
+            break;
         }
 
         if (add_client(fd) == -1 && sync_mode)
-            return EXIT_FAILURE;
+        {
+            accept_error = 1;
+            break;
+        }
 
         if (sync_mode)
             accepted++;
     }
 
     pthread_mutex_lock(&mutex);
+    if (stopping || accept_error)
+    {
+        for (int i = 0; i < MAX_CLIENTS; i++)
+            if (clients[i] != NULL)
+                (void)shutdown(clients[i]->request.aio_fildes, SHUT_RDWR);
+    }
 
     while (active > 0)
         pthread_cond_wait(&finished, &mutex);
 
-    int status = (!failed && sync_stage == 4)
+    int status = (stopping && !accept_error) ||
+                         (sync_mode && !failed && !accept_error && sync_stage == 4)
                      ? EXIT_SUCCESS
                      : EXIT_FAILURE;
-
     pthread_mutex_unlock(&mutex);
-
     return status;
 }
 
@@ -418,7 +475,9 @@ int main(int argc, char *argv[])
     struct sockaddr_un address;
     struct sigaction action;
     pthread_t collector;
+    pthread_t watcher;
     int status;
+    main_thread = pthread_self();
 
     if (argc > 2 ||
         (argc == 2 && strcmp(argv[1], "--sync") != 0))
@@ -470,9 +529,16 @@ int main(int argc, char *argv[])
 
     sigemptyset(&completion_signals);
     sigaddset(&completion_signals, SIGUSR1);
+    sigemptyset(&termination_signals);
+    sigaddset(&termination_signals, SIGINT);
+    sigaddset(&termination_signals, SIGTERM);
+    sigaddset(&termination_signals, SIGHUP);
+    sigset_t blocked = completion_signals;
+    sigaddset(&blocked, SIGINT);
+    sigaddset(&blocked, SIGTERM);
+    sigaddset(&blocked, SIGHUP);
 
-    int error = pthread_sigmask(SIG_BLOCK,
-                                &completion_signals, NULL);
+    int error = pthread_sigmask(SIG_BLOCK, &blocked, NULL);
     if (error != 0)
     {
         errno = error;
@@ -483,12 +549,11 @@ int main(int argc, char *argv[])
     }
 
     memset(&action, 0, sizeof(action));
-    action.sa_handler = stop_server;
+    action.sa_handler = interrupt_accept;
     sigemptyset(&action.sa_mask);
+    action.sa_flags = 0;
 
-    if (sigaction(SIGINT, &action, NULL) == -1 ||
-        sigaction(SIGTERM, &action, NULL) == -1 ||
-        sigaction(SIGHUP, &action, NULL) == -1 ||
+    if (sigaction(SIGUSR2, &action, NULL) == -1 ||
         signal(SIGPIPE, SIG_IGN) == SIG_ERR)
     {
         perror("signal");
@@ -508,7 +573,20 @@ int main(int argc, char *argv[])
         return EXIT_FAILURE;
     }
 
-    pthread_detach(collector);
+    error = pthread_create(&watcher, NULL, watch_termination, NULL);
+    if (error != 0)
+    {
+        errno = error;
+        perror("pthread_create termination");
+        pthread_mutex_lock(&mutex);
+        collector_done = 1;
+        pthread_mutex_unlock(&mutex);
+        (void)pthread_kill(collector, SIGUSR1);
+        (void)pthread_join(collector, NULL);
+        close(listener);
+        unlink(path);
+        return EXIT_FAILURE;
+    }
 
     printf("Server PID: %ld\n", (long)getpid());
     printf("Socket: %s\n", path);
@@ -518,6 +596,16 @@ int main(int argc, char *argv[])
     fflush(stdout);
 
     status = serve(listener);
+
+    pthread_mutex_lock(&mutex);
+    collector_done = 1;
+    pthread_mutex_unlock(&mutex);
+    (void)pthread_kill(collector, SIGUSR1);
+    (void)pthread_join(collector, NULL);
+
+    if (!stopping)
+        (void)pthread_kill(watcher, SIGTERM);
+    (void)pthread_join(watcher, NULL);
 
     close(listener);
     listener = -1;

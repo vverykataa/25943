@@ -82,7 +82,11 @@ static int receive_text(int client_fd)
         if (n == -1)
         {
             if (errno == EINTR)
+            {
+                if (stopped)
+                    return EXIT_FAILURE;
                 continue;
+            }
 
             perror("read socket");
             return EXIT_FAILURE;
@@ -185,7 +189,11 @@ int main(int argc, char *argv[])
         if (client_fd == -1)
         {
             if (errno == EINTR)
+            {
+                if (stopped)
+                    break;
                 continue;
+            }
 
             perror("accept");
             goto cleanup;
